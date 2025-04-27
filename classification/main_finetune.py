@@ -17,12 +17,19 @@ import os
 import time
 from pathlib import Path
 import importlib
+import warnings
+
+from collections import defaultdict
+from torchvision import datasets, transforms
 
 import torch
 
 # import torchinfo
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 
 import timm
 
@@ -37,272 +44,100 @@ import util.misc as misc
 from util.datasets import build_dataset
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.kd_loss import DistillationLoss
+from util.datasets import CIFAR10CDataset
 
-import models
-import models_sew
+import models_new
 
 from engine_finetune import train_one_epoch, evaluate
 from timm.data import create_loader
 
+import wandb
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 def get_args_parser():
-    # important params
-    parser = argparse.ArgumentParser(
-        "MAE fine-tuning for image classification", add_help=False
-    )
-    parser.add_argument(
-        "--batch_size",
-        default=64,
-        type=int,
-        help="Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus",
-    )
-    parser.add_argument("--epochs", default=200, type=int)  # 20/30(T=4)
-    parser.add_argument(
-        "--accum_iter",
-        default=1,
-        type=int,
-        help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)",
-    )
-    parser.add_argument("--finetune", default="", help="finetune from checkpoint")
-    parser.add_argument(
-        "--data_path", default="/raid/ligq/imagenet1-k/", type=str, help="dataset path"
-    )
+    parser = argparse.ArgumentParser("MAE fine-tuning for image classification", add_help=False)
+
+    # Basic training params
+    parser.add_argument("--batch_size", default=64, type=int, help="Batch size per GPU (effective batch size = batch_size * accum_iter * #GPUs)")
+    parser.add_argument("--epochs", default=200, type=int)
+    parser.add_argument("--accum_iter", default=1, type=int, help="Gradient accumulation steps")
+    parser.add_argument("--finetune", default="", help="Finetune from checkpoint")
+    parser.add_argument("--data_path", default="./data/cifar10/", type=str, help="Dataset path")
+    parser.add_argument("--dataset", default="CIFAR10")
 
     # Model parameters
-    parser.add_argument(
-        "--model",
-        default="spikformer_8_384_CAFormer",
-        type=str,
-        metavar="MODEL",
-        help="Name of model to train",
-    )
-    parser.add_argument(
-        "--model_mode",
-        default="ms",
-        type=str,
-        help="Mode of model to train",
-    )
+    parser.add_argument("--model", default="spikformer_8_384_CAFormer", type=str, metavar="MODEL", help="Model name")
+    parser.add_argument("--model_mode", default="ms", type=str, help="Model mode")
+    parser.add_argument("--input_size", default=224, type=int, help="Input image size")
+    parser.add_argument("--drop_path", default=0.1, type=float, help="Drop path rate")
 
-    parser.add_argument("--input_size", default=224, type=int, help="images input size")
+    # Optimizer
+    parser.add_argument("--clip_grad", default=None, type=float, help="Gradient clipping (None = no clipping)")
+    parser.add_argument("--weight_decay", default=0.05, type=float, help="Weight decay")
+    parser.add_argument("--lr", default=None, type=float, help="Absolute learning rate")
+    parser.add_argument("--blr", default=6e-4, type=float, help="Base LR: base_lr * total_batch_size / 256")
+    parser.add_argument("--layer_decay", default=1.0, type=float, help="Layer-wise learning rate decay")
+    parser.add_argument("--min_lr", default=1e-6, type=float, help="Min learning rate")
+    parser.add_argument("--warmup_epochs", default=0, type=int, help="Warmup epochs")
 
-    parser.add_argument(
-        "--drop_path",
-        type=float,
-        default=0.1,
-        metavar="PCT",
-        help="Drop path rate (default: 0.1)",
-    )
+    # Augmentation
+    parser.add_argument("--color_jitter", default=None, type=float, help="Color jitter (if not using RandAug)")
+    parser.add_argument("--aa", default="rand-m9-mstd0.5-inc1", type=str, help="AutoAugment policy")
+    parser.add_argument("--smoothing", default=0.1, type=float, help="Label smoothing")
 
-    # Optimizer parameters
-    parser.add_argument(
-        "--clip_grad",
-        type=float,
-        default=None,
-        metavar="NORM",
-        help="Clip gradient norm (default: None, no clipping)",
-    )
-    parser.add_argument(
-        "--weight_decay", type=float, default=0.05, help="weight decay (default: 0.05)"
-    )
+    # Random Erase
+    parser.add_argument("--reprob", default=0.25, type=float, help="Random erase probability")
+    parser.add_argument("--remode", default="pixel", type=str, help="Random erase mode")
+    parser.add_argument("--recount", default=1, type=int, help="Random erase count")
+    parser.add_argument("--resplit", action="store_true", help="Don’t erase first augmentation split")
 
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=None,
-        metavar="LR",
-        help="learning rate (absolute lr)",
-    )
-    parser.add_argument(
-        "--blr",
-        type=float,
-        default=6e-4,
-        metavar="LR",  # 1e-5,2e-5(T=4)
-        help="base learning rate: absolute_lr = base_lr * total_batch_size / 256",
-    )
-    parser.add_argument(
-        "--layer_decay",
-        type=float,
-        default=1.0,
-        help="layer-wise lr decay from ELECTRA/BEiT",
-    )
+    # Mixup / Cutmix
+    parser.add_argument("--mixup", default=0.0, type=float, help="Mixup alpha")
+    parser.add_argument("--cutmix", default=0.0, type=float, help="Cutmix alpha")
+    parser.add_argument("--cutmix_minmax", nargs="+", type=float, default=None, help="Cutmix min/max ratio")
+    parser.add_argument("--mixup_prob", default=1.0, type=float, help="Probability of mixup/cutmix")
+    parser.add_argument("--mixup_switch_prob", default=0.5, type=float, help="Probability to switch to cutmix")
+    parser.add_argument("--mixup_mode", default="batch", type=str, help="Mixup mode: batch | pair | elem")
 
-    parser.add_argument(
-        "--min_lr",
-        type=float,
-        default=1e-6,
-        metavar="LR",
-        help="lower lr bound for cyclic schedulers that hit 0",
-    )
-
-    parser.add_argument(
-        "--warmup_epochs", type=int, default=10, metavar="N", help="epochs to warmup LR"
-    )
-
-    # Augmentation parameters
-    parser.add_argument(
-        "--color_jitter",
-        type=float,
-        default=None,
-        metavar="PCT",
-        help="Color jitter factor (enabled only when not using Auto/RandAug)",
-    )
-    parser.add_argument(
-        "--aa",
-        type=str,
-        default="rand-m9-mstd0.5-inc1",
-        metavar="NAME",
-        help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)',
-    ),
-    parser.add_argument(
-        "--smoothing", type=float, default=0.1, help="Label smoothing (default: 0.1)"
-    )
-
-    # * Random Erase params
-    parser.add_argument(
-        "--reprob",
-        type=float,
-        default=0.25,
-        metavar="PCT",
-        help="Random erase prob (default: 0.25)",
-    )
-    parser.add_argument(
-        "--remode",
-        type=str,
-        default="pixel",
-        help='Random erase mode (default: "pixel")',
-    )
-    parser.add_argument(
-        "--recount", type=int, default=1, help="Random erase count (default: 1)"
-    )
-    parser.add_argument(
-        "--resplit",
-        action="store_true",
-        default=False,
-        help="Do not random erase first (clean) augmentation split",
-    )
-
-    # * Mixup params
-    parser.add_argument(
-        "--mixup", type=float, default=0, help="mixup alpha, mixup enabled if > 0."
-    )
-    parser.add_argument(
-        "--cutmix", type=float, default=0, help="cutmix alpha, cutmix enabled if > 0."
-    )
-    parser.add_argument(
-        "--cutmix_minmax",
-        type=float,
-        nargs="+",
-        default=None,
-        help="cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)",
-    )
-    parser.add_argument(
-        "--mixup_prob",
-        type=float,
-        default=1.0,
-        help="Probability of performing mixup or cutmix when either/both is enabled",
-    )
-    parser.add_argument(
-        "--mixup_switch_prob",
-        type=float,
-        default=0.5,
-        help="Probability of switching to cutmix when both mixup and cutmix enabled",
-    )
-    parser.add_argument(
-        "--mixup_mode",
-        type=str,
-        default="batch",
-        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"',
-    )
-
-    # * Finetuning params
-
+    # Finetuning
     parser.add_argument("--global_pool", action="store_true")
     parser.set_defaults(global_pool=True)
-    parser.add_argument(
-        "--cls_token",
-        action="store_false",
-        dest="global_pool",
-        help="Use class token instead of global pool for classification",
-    )
+    parser.add_argument("--cls_token", action="store_false", dest="global_pool", help="Use class token instead of global pooling")
     parser.add_argument("--time_steps", default=1, type=int)
 
-    # Dataset parameters
+    # Dataset
+    parser.add_argument("--nb_classes", default=1000, type=int, help="Number of classes")
+    parser.add_argument("--output_dir", default="/raid/ligq/htx/spikemae/output_dir", help="Output directory")
+    parser.add_argument("--log_dir", default="/raid/ligq/htx/spikemae/output_dir", help="Tensorboard log directory")
+    parser.add_argument("--c_eval", action='store_true')
 
-    parser.add_argument(
-        "--nb_classes",
-        default=1000,
-        type=int,
-        help="number of the classification types",
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        default="/raid/ligq/htx/spikemae/output_dir",
-        help="path where to save, empty for no saving",
-    )
-    parser.add_argument(
-        "--log_dir",
-        default="/raid/ligq/htx/spikemae/output_dir",
-        help="path where to tensorboard log",
-    )
-    parser.add_argument(
-        "--device", default="cuda", help="device to use for training / testing"
-    )
+    # System
+    parser.add_argument("--device", default="cuda", help="Device to use")
     parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument("--resume", default=None, help="resume from checkpoint")
-
-    parser.add_argument(
-        "--start_epoch", default=0, type=int, metavar="N", help="start epoch"
-    )
-    parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
-    parser.add_argument(
-        "--dist_eval",
-        action="store_true",
-        default=False,
-        help="Enabling distributed evaluation (recommended during training for faster monitor",
-    )
+    parser.add_argument("--resume", default=None, help="Resume from checkpoint")
+    parser.add_argument("--start_epoch", default=0, type=int, help="Starting epoch")
+    parser.add_argument("--eval", action="store_true", help="Evaluation only")
+    parser.add_argument("--dist_eval", action="store_true", default=False, help="Enable distributed evaluation")
     parser.add_argument("--num_workers", default=10, type=int)
-    parser.add_argument(
-        "--pin_mem",
-        action="store_true",
-        help="Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.",
-    )
+    parser.add_argument("--pin_mem", action="store_true", help="Pin memory in DataLoader")
     parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
     parser.set_defaults(pin_mem=True)
 
-    # Distillation parameters
-    parser.add_argument(
-        "--kd",
-        action="store_true",
-        default=False,
-        help="kd or not",
-    )
-    parser.add_argument(
-        "--teacher_model",
-        default="caformer_b36_in21ft1k",
-        type=str,
-        metavar="MODEL",
-        help='Name of teacher model to train (default: "caformer_b36_in21ft1k"',
-    )
-    parser.add_argument(
-        "--distillation_type",
-        default="none",
-        choices=["none", "soft", "hard"],
-        type=str,
-        help="",
-    )
-    parser.add_argument("--distillation_alpha", default=0.5, type=float, help="")
-    parser.add_argument("--distillation_tau", default=1.0, type=float, help="")
+    # Distillation
+    parser.add_argument("--kd", action="store_true", default=False, help="Enable knowledge distillation")
+    parser.add_argument("--teacher_model", default="caformer_b36_in21ft1k", type=str, help="Teacher model name")
+    parser.add_argument("--distillation_type", default="none", choices=["none", "soft", "hard"], help="Distillation type")
+    parser.add_argument("--distillation_alpha", default=0.5, type=float, help="Distillation loss weight")
+    parser.add_argument("--distillation_tau", default=1.0, type=float, help="Distillation temperature")
 
-    # distributed training parameters
-    parser.add_argument(
-        "--world_size", default=1, type=int, help="number of distributed processes"
-    )
+    # Distributed training
+    parser.add_argument("--world_size", default=1, type=int, help="Number of distributed processes")
     parser.add_argument("--local-rank", default=-1, type=int)
     parser.add_argument("--dist_on_itp", action="store_true")
-    parser.add_argument(
-        "--dist_url", default="env://", help="url used to set up distributed training"
-    )
+    parser.add_argument("--dist_url", default="env://", help="Distributed training URL")
+
+    parser.add_argument("--push_pull", action='store_true')
 
     return parser
 
@@ -320,7 +155,9 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    cudnn.benchmark = True
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+    
 
     dataset_train = build_dataset(is_train=True, args=args)
     dataset_val = build_dataset(is_train=False, args=args)
@@ -348,7 +185,7 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    if global_rank == 0 and args.log_dir is not None and not args.eval:
+    if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
@@ -388,15 +225,17 @@ def main(args):
         )
 
     if args.model_mode == "ms":
-        model = models.__dict__[args.model](kd=args.kd)
-    elif args.model_mode == "sew":
-        model = models_sew.__dict__[args.model]()
+        if args.dataset == "CIFAR10":
+            model = models_new.__dict__[args.model](img_size=32, num_classes=10, push_pull=args.push_pull)
+            print('Loaded CIFAR model')
+        else:
+            model = models_new.__dict__[args.model]()
     model.T = args.time_steps
 
-    if args.finetune and not args.eval:
-        checkpoint = torch.load(args.finetune, map_location="cpu")
+    if  args.resume:
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
 
-        print("Load pre-trained checkpoint from: %s" % args.finetune)
+        print("Load pre-trained checkpoint from: %s" % args.resume)
         checkpoint_model = checkpoint["model"]
         # state_dict = model.state_dict()
         # for k in ["head.weight", "head.bias"]:
@@ -451,8 +290,16 @@ def main(args):
         # no_weight_decay_list=model_without_ddp.no_weight_decay(),
         layer_decay=args.layer_decay,
     )
-    # optimizer = torch.optim.AdamW(param_groups, lr=args.lr) # lamb
-    optimizer = optim_factory.Lamb(param_groups, trust_clip=True, lr=args.lr)
+
+    if args.dataset == "CIFAR10":
+        # AdamW optimizer with lr of 1e-3 and weight decay of 6e-2
+        optimizer = AdamW(param_groups, lr=1e-3, weight_decay=6e-2)
+    
+    else:
+        # optimizer = torch.optim.AdamW(param_groups, lr=args.lr) # lamb
+        optimizer = optim_factory.Lamb(param_groups, trust_clip=True, lr=args.lr)
+        lr_scheduler = None
+    
     loss_scaler = NativeScaler()
 
     if mixup_fn is not None:
@@ -498,6 +345,65 @@ def main(args):
         print(
             f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
         )
+
+        clean_acc = test_stats['acc1']
+
+        if args.c_eval:
+
+            c_dataset_class = CIFAR10CDataset
+
+            test_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                    std=[0.2470, 0.2435, 0.2616]),
+            ])
+
+            severities = (1,2,3,4,5)
+
+            corruption_to_accuracies = defaultdict(list)
+
+            for corruption in c_dataset_class.corruptions:
+                for severity in severities:
+                    c_s_dst = c_dataset_class(
+                        '/tmp/dataset/', transform=test_transform, severity=severity, corruption=corruption
+                    )
+
+                    corrupt_sampler = torch.utils.data.distributed.DistributedSampler(c_s_dst, num_replicas=num_tasks, rank=global_rank, shuffle=False, drop_last=False)
+
+                    c_s_loader = torch.utils.data.DataLoader(
+                                    c_s_dst, batch_size=args.batch_size, shuffle=False,
+                                    num_workers=args.num_workers, pin_memory=True, sampler=corrupt_sampler)
+
+                    test_stats = evaluate(c_s_loader, model, device)
+
+                    acc = test_stats['acc1']  # Top-1 accuracy
+        
+                    corruption_to_accuracies[corruption].append(acc)
+
+            # Step 3: after the loop, calculate averages
+            corruption_to_avg_acc = {}
+
+            for corruption, acc_list in corruption_to_accuracies.items():
+                avg_acc = sum(acc_list) / len(acc_list)
+                corruption_to_avg_acc[corruption] = avg_acc
+
+            # Step 4: create and log a markdown table
+            table = "| Corruption | Average Accuracy (%) |\n"
+            table += "|:-----------|----------------------:|\n"
+            table += f"| Clean | {clean_acc:.2f} |\n"
+
+            # Now add the overall average across corruptions
+            all_corruption_avg = sum(corruption_to_avg_acc.values()) / len(corruption_to_avg_acc)
+            table += f"| **Average (Corruptions)** | **{all_corruption_avg:.2f}** |\n"
+
+            for corruption, avg_acc in corruption_to_avg_acc.items():
+                table += f"| {corruption} | {avg_acc:.2f} |\n"
+
+            if global_rank == 0:
+                log_writer.add_text('CIFAR10C Average Accuracies', table, global_step=0)
+
+                log_writer.close()
+
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
@@ -519,7 +425,7 @@ def main(args):
             args.clip_grad,
             mixup_fn,
             log_writer=log_writer,
-            args=args,
+            args=args
         )
         if args.output_dir and (epoch % 50 == 0 or epoch + 1 == args.epochs):
             print("Saving model at epoch:", epoch)
@@ -530,6 +436,7 @@ def main(args):
                 optimizer=optimizer,
                 loss_scaler=loss_scaler,
                 epoch=epoch,
+                best_model=False
             )
 
         test_stats = evaluate(data_loader_val, model, device)
@@ -547,6 +454,7 @@ def main(args):
                 optimizer=optimizer,
                 loss_scaler=loss_scaler,
                 epoch=epoch,
+                best_model=True
             )
 
         if log_writer is not None:

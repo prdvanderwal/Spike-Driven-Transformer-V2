@@ -8,6 +8,20 @@ import math
 
 
 def adjust_learning_rate(optimizer, epoch, args):
+    if args.dataset == "CIFAR10":
+        lr = args.min_lr + (args.lr - args.min_lr) * 0.5 * (
+        1.0 + math.cos(math.pi * epoch / args.epochs)
+    )
+    
+    # Update the learning rate for each parameter group
+    for param_group in optimizer.param_groups:
+        if "lr_scale" in param_group:
+            param_group["lr"] = lr * param_group["lr_scale"]
+        else:
+            param_group["lr"] = lr
+
+    return lr
+
     """Decay the learning rate with half-cycle cosine after warmup"""
     if epoch < args.warmup_epochs:
         lr = args.lr * epoch / args.warmup_epochs

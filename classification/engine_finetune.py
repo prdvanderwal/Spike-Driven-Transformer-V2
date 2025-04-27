@@ -14,9 +14,12 @@ import sys
 from typing import Iterable, Optional
 
 import torch
+import torchvision.transforms as transforms
 
 from timm.data import Mixup
 from timm.utils import accuracy
+
+from util.datasets import CIFAR10CDataset
 
 import util.misc as misc
 import util.lr_sched as lr_sched
