@@ -87,6 +87,11 @@ class MS_Attention_pushpull(nn.Module):
         self.qoff_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
         self.qpp_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
 
+        self.push_w = nn.Parameter(torch.tensor(1.0))
+        self.pull_w = nn.Parameter(torch.tensor(1.0))
+        self.softplus = nn.Softplus()
+        self.pp_bias = nn.Parameter(torch.tensor(0.0))
+
         self.k_conv = nn.Sequential(
             nn.Conv1d(dim, dim, kernel_size=1, stride=1),
             nn.BatchNorm1d(dim)
@@ -157,7 +162,12 @@ class MS_Attention_pushpull(nn.Module):
             .contiguous()
         )
 
-        q_pp = self.qpp_lif(q_on-q_off)
+        pw = self.softplus(self.push_w)
+        pl = self.softplus(self.pull_w)
+
+        diff = pw * q_on - pl * q_off + self.pp_bias
+
+        q_pp = self.qpp_lif(diff)
 
         x = k.transpose(-2, -1) @ v
         x = (q_pp @ x) * self.scale
@@ -520,7 +530,8 @@ class Spiking_vit_SpiLiFormer(nn.Module):
         depths=[1, 1, 2],
         sr_ratios=[8, 4, 2],
         T=4,
-        push_pull=False
+        push_pull=False,
+        lateral_inhibition=False
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -554,8 +565,9 @@ class Spiking_vit_SpiLiFormer(nn.Module):
                 drop_path=drop_path_rate,
                 norm_layer=norm_layer,
                 sr_ratio=sr_ratios[0],
-                lateral_inhibition=True,  # FF-LiDiff for shallow blocks
+                lateral_inhibition=lateral_inhibition,  # FF-LiDiff for shallow blocks
                 use_feedback=False,
+                push_pull=push_pull
             )
             for i in range(depths[0])
         ])
@@ -583,7 +595,7 @@ class Spiking_vit_SpiLiFormer(nn.Module):
                 drop_path=drop_path_rate,
                 norm_layer=norm_layer,
                 sr_ratio=sr_ratios[1],
-                lateral_inhibition=True,  # FF-LiDiff for shallow blocks
+                lateral_inhibition=lateral_inhibition,  # FF-LiDiff for shallow blocks
                 use_feedback=False,
                 push_pull=push_pull,
             )
@@ -613,8 +625,9 @@ class Spiking_vit_SpiLiFormer(nn.Module):
                 drop_path=drop_path_rate,
                 norm_layer=norm_layer,
                 sr_ratio=sr_ratios[2],
-                lateral_inhibition=False,  # FB-LiDiff for deep blocks
-                use_feedback=False,        # Enable feedback for FB-LiDiff
+                lateral_inhibition=lateral_inhibition,  # FB-LiDiff for deep blocks
+                use_feedback=False, # Enable feedback for FB-LiDiff
+                push_pull=push_pull       
             )
             for i in range(depths[2])
         ])

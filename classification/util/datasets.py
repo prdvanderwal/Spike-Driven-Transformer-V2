@@ -38,12 +38,18 @@ def build_transform(is_train, args):
         CIFAR10_STD = [0.2023, 0.1994, 0.2010]
 
     if is_train:
-        transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),  # slight translation
-            transforms.RandomHorizontalFlip(),  # simple augmentation
-            transforms.ToTensor(),
-            transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-        ])
+        transform = create_transform(
+            input_size=32,
+            is_training=True,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            interpolation="bicubic",
+            re_prob=args.reprob,
+            re_mode=args.remode,
+            re_count=args.recount,
+            mean=CIFAR10_MEAN,
+            std=CIFAR10_STD,
+        )
     else:
         transform = transforms.Compose([
             transforms.ToTensor(),

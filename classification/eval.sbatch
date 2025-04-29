@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH -J CIFAR10-LISNN-Pushpull
 #SBATCH --output=slurm-%j_x.out
-#SBATCH --array=0
+#SBATCH --array=0-1
 #SBATCH -c 8
-#SBATCH --time=00-02:00:00
-#SBATCH --gres=gpu:2
+#SBATCH --time=00-01:00:00
+#SBATCH --gres=gpu:1
 #SBATCH --mem=24GB
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 
 set -e
 set -x
@@ -38,24 +38,29 @@ ls "$TMPDIR/dataset/CIFAR-10-C"
 
 
 # Runtime variables
+DATASET_NAME="CIFAR10"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SEED=32
 SESSION_ID=$(openssl rand -hex 4)
 
+COMMON_ARGS="--batch_size 128 --model spiliformer_tiny --data_path ../data/cifar10/ \
+             --model_mode ms --dataset ${DATASET_NAME} --seed ${SEED} --eval --c_eval \
+             --time_steps 4 --wandb"
 
-torchrun --standalone --nproc_per_node=2 \
-  main_finetune.py \
-  --batch_size 32 \
-  --model spiliformer_tiny \
-  --data_path ../data/cifar10/ \
-  --output_dir "outputs/CIFAR10/${TIMESTAMP}_eval/" \
-  --log_dir "outputs/CIFAR10/${TIMESTAMP}_eval/" \
-  --model_mode ms \
-  --dataset CIFAR10 \
-  --seed ${SEED} \
-  --eval \
-  --resume /home4/p315895/Spike-Driven-Transformer-V2/classification/outputs/CIFAR10/20250424_235937/checkpoint-399.pth \
-  --c_eval
+EXPERIMENT_NAME="outputs/${DATASET_NAME}/${TIMESTAMP}_s${SEED}"
+
+
+# Initialize job array
+case ${SLURM_ARRAY_TASK_ID} in
+0) torchrun --standalone --nproc_per_node=1 main_finetune.py ${COMMON_ARGS} --push_pull --lateral_inhibition --wandb_tags CIFAR10 only-pp tiny --resume /home4/p315895/Spike-Driven-Transformer-V2/classification/outputs/CIFAR10/20250429_100501_s32-onlypp/best_model.pth;;
+1) torchrun --standalone --nproc_per_node=1 main_finetune.py ${COMMON_ARGS} --wandb_tags CIFAR10 no-inhi tiny --resume /home4/p315895/Spike-Driven-Transformer-V2/classification/outputs/CIFAR10/20250428_224411_s32_noinhibition/best_model.pth
+esac
+
+echo "script finished"
+
+
+<<'END'
+  
 
 
 

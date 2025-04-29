@@ -138,6 +138,13 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", help="Distributed training URL")
 
     parser.add_argument("--push_pull", action='store_true')
+    parser.add_argument("--lateral_inhibition", action='store_true')
+
+    # WandB 
+    parser.add_argument('--wandb', action='store_false', help='USe wandb by default. Trigger to disable wandb')
+    parser.add_argument('--name', type=str, default='')
+    parser.add_argument('--wandb_tags', type=str, nargs='+', default=None)
+
 
     return parser
 
@@ -185,9 +192,19 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
+
+    wandb_log = misc.is_main_process()
+    if global_rank == 0:
+        wandb.login(key="27656ca0b0297d3f09e317d7a47bd97275cc33a1")
+        wandb.init(
+            project="LIT",
+            name=args.name,
+            id=wandb.util.generate_id(),
+            tags=args.wandb_tags,
+            resume='auto',
+            config=vars(args),
+        )
+    
     else:
         log_writer = None
 
@@ -226,7 +243,7 @@ def main(args):
 
     if args.model_mode == "ms":
         if args.dataset == "CIFAR10":
-            model = models_new.__dict__[args.model](img_size=32, num_classes=10, push_pull=args.push_pull)
+            model = models_new.__dict__[args.model](img_size=32, num_classes=10, push_pull=args.push_pull, lateral_inhibition=args.lateral_inhibition)
             print('Loaded CIFAR model')
         else:
             model = models_new.__dict__[args.model]()
@@ -296,7 +313,6 @@ def main(args):
         optimizer = AdamW(param_groups, lr=1e-3, weight_decay=6e-2)
     
     else:
-        # optimizer = torch.optim.AdamW(param_groups, lr=args.lr) # lamb
         optimizer = optim_factory.Lamb(param_groups, trust_clip=True, lr=args.lr)
         lr_scheduler = None
     
@@ -341,12 +357,15 @@ def main(args):
     )
 
     if args.eval:
+
         test_stats = evaluate(data_loader_val, model, device)
         print(
             f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
         )
 
         clean_acc = test_stats['acc1']
+
+        resultsTable = wandb.Table(columns=["corruption", "accuracy"])
 
         if args.c_eval:
 
@@ -386,23 +405,18 @@ def main(args):
             for corruption, acc_list in corruption_to_accuracies.items():
                 avg_acc = sum(acc_list) / len(acc_list)
                 corruption_to_avg_acc[corruption] = avg_acc
-
-            # Step 4: create and log a markdown table
-            table = "| Corruption | Average Accuracy (%) |\n"
-            table += "|:-----------|----------------------:|\n"
-            table += f"| Clean | {clean_acc:.2f} |\n"
-
+            
             # Now add the overall average across corruptions
             all_corruption_avg = sum(corruption_to_avg_acc.values()) / len(corruption_to_avg_acc)
-            table += f"| **Average (Corruptions)** | **{all_corruption_avg:.2f}** |\n"
+            
+            resultsTable.add_data('Clean', clean_acc)
+            resultsTable.add_data('Average', all_corruption_avg)        
 
             for corruption, avg_acc in corruption_to_avg_acc.items():
-                table += f"| {corruption} | {avg_acc:.2f} |\n"
+                resultsTable.add_data(corruption, avg_acc)
 
             if global_rank == 0:
-                log_writer.add_text('CIFAR10C Average Accuracies', table, global_step=0)
-
-                log_writer.close()
+                wandb.log({'corruption_table': resultsTable})
 
         exit(0)
 
@@ -427,7 +441,7 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 50 == 0 or epoch + 1 == args.epochs):
+        if (epoch % 50 == 0 or epoch + 1 == args.epochs):
             print("Saving model at epoch:", epoch)
             misc.save_model(
                 args=args,
@@ -445,7 +459,7 @@ def main(args):
         )
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f"Max accuracy: {max_accuracy:.2f}%")
-        if args.output_dir and test_stats["acc1"] > best_acc:
+        if test_stats["acc1"] > best_acc:
             print("Saving model at epoch:", epoch)
             misc.save_model(
                 args=args,
@@ -457,25 +471,18 @@ def main(args):
                 best_model=True
             )
 
-        if log_writer is not None:
-            log_writer.add_scalar("perf/test_acc1", test_stats["acc1"], epoch)
-            log_writer.add_scalar("perf/test_acc5", test_stats["acc5"], epoch)
-            log_writer.add_scalar("perf/test_loss", test_stats["loss"], epoch)
+            if wandb_log:
+                wandb.log({
+                    "test/acc1": test_stats["acc1"],
+                    "test/acc5": test_stats["acc5"],
+                    "test/loss": test_stats["loss"],
+                    "epoch": epoch,
+                })
 
-        log_stats = {
-            **{f"train_{k}": v for k, v in train_stats.items()},
-            **{f"test_{k}": v for k, v in test_stats.items()},
-            "epoch": epoch,
-            "n_parameters": n_parameters,
-        }
-
-        if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(
-                os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8"
-            ) as f:
-                f.write(json.dumps(log_stats) + "\n")
+                # if args.push_pull:
+                #     for idx, block in enumerate(model.module.stage2_blocks):
+                #         wandb.log(f'PushPull/Block{idx}_Push', block.attn.softplus(block.attn.push_w).item(), epoch)
+                #         wandb.log(f'PushPull/Block{idx}_Pull', block.attn.softplus(block.attn.pull_w).item(), epoch)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -485,6 +492,4 @@ def main(args):
 if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
