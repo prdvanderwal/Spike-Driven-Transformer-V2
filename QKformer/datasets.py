@@ -1,13 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-# References:
-# DeiT: https://github.com/facebookresearch/deit
-# --------------------------------------------------------
-
 import os
 import PIL
 
@@ -17,7 +7,6 @@ import numpy as np
 
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
 
 
 
@@ -94,7 +83,6 @@ def build_transform(is_train, args):
     t.append(transforms.ToTensor())
     t.append(transforms.Normalize(mean, std))
     return transforms.Compose(t)
-
 
 class CIFAR10CDataset(VisionDataset):
     mean = (0.4915, 0.4823, 0.4468)

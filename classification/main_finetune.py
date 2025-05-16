@@ -46,7 +46,9 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.kd_loss import DistillationLoss
 from util.datasets import CIFAR10CDataset
 
-import models_new
+from ppformer import *
+
+
 
 from engine_finetune import train_one_epoch, evaluate
 from timm.data import create_loader
@@ -54,6 +56,15 @@ from timm.data import create_loader
 import wandb
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# Step 1: Define string-to-class mapping
+transformer_dict = {
+    "lidiff": LiDiffTransformer,
+    "pp": PPTransformer,
+    "spiking": SpikingTransformer,
+    "token": TokenSpikingTransformer,
+    "pptoken": PushPullTransformer
+}
 
 def get_args_parser():
     parser = argparse.ArgumentParser("MAE fine-tuning for image classification", add_help=False)
@@ -119,9 +130,11 @@ def get_args_parser():
     parser.add_argument("--start_epoch", default=0, type=int, help="Starting epoch")
     parser.add_argument("--eval", action="store_true", help="Evaluation only")
     parser.add_argument("--dist_eval", action="store_true", default=False, help="Enable distributed evaluation")
-    parser.add_argument("--num_workers", default=10, type=int)
+    parser.add_argument("--num_workers", default=8, type=int)
     parser.add_argument("--pin_mem", action="store_true", help="Pin memory in DataLoader")
     parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
+    parser.add_argument('--channels-last', action='store_true', default=False,
+                    help='Use channels_last memory layout')
     parser.set_defaults(pin_mem=True)
 
     # Distillation
@@ -144,6 +157,11 @@ def get_args_parser():
     parser.add_argument('--wandb', action='store_false', help='USe wandb by default. Trigger to disable wandb')
     parser.add_argument('--name', type=str, default='')
     parser.add_argument('--wandb_tags', type=str, nargs='+', default=None)
+
+    # Custom Transformers
+    parser.add_argument("--stage1", type=str, default="lidiff", choices=transformer_dict.keys())
+    parser.add_argument("--stage2", type=str, default="pp", choices=transformer_dict.keys())
+    parser.add_argument("--stage3", type=str, default="spiking", choices=transformer_dict.keys())
 
 
     return parser
@@ -204,9 +222,6 @@ def main(args):
             resume='auto',
             config=vars(args),
         )
-    
-    else:
-        log_writer = None
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train,
@@ -240,13 +255,22 @@ def main(args):
             label_smoothing=args.smoothing,
             num_classes=args.nb_classes,
         )
+    
+    # Step 3: Build list of transformer classes
+    transformer_classes = [
+        transformer_dict[args.stage1],
+        transformer_dict[args.stage2],
+        transformer_dict[args.stage3]
+    ]
+
 
     if args.model_mode == "ms":
-        if args.dataset == "CIFAR10":
-            model = models_new.__dict__[args.model](img_size=32, num_classes=10, push_pull=args.push_pull, lateral_inhibition=args.lateral_inhibition)
-            print('Loaded CIFAR model')
-        else:
-            model = models_new.__dict__[args.model]()
+        # if args.dataset == "CIFAR10":
+        #     model = models_new.__dict__[args.model](img_size=32, num_classes=10, push_pull=args.push_pull, lateral_inhibition=args.lateral_inhibition)
+        #     print('Loaded CIFAR model')
+        # else:
+        model = QKFormer_10_768(T=args.time_steps, transformer_classes=transformer_classes)
+    
     model.T = args.time_steps
 
     if  args.resume:
@@ -276,6 +300,11 @@ def main(args):
         # trunc_normal_(model.head.weight, std=2e-5)  # T=4注释
 
     model.to(device)
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+
+    param_mem = sum(p.numel() for p in model.parameters()) * 4 / (1024**2)
+    print(f"Model parameters memory: {param_mem:.2f} MB")
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -313,7 +342,7 @@ def main(args):
         optimizer = AdamW(param_groups, lr=1e-3, weight_decay=6e-2)
     
     else:
-        optimizer = optim_factory.Lamb(param_groups, trust_clip=True, lr=args.lr)
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
         lr_scheduler = None
     
     loss_scaler = NativeScaler()
@@ -349,12 +378,12 @@ def main(args):
 
     print("criterion = %s" % str(criterion))
 
-    misc.load_model(
-        args=args,
-        model_without_ddp=model_without_ddp,
-        optimizer=optimizer,
-        loss_scaler=loss_scaler,
-    )
+    # misc.load_model(
+    #     args=args,
+    #     model_without_ddp=model_without_ddp,
+    #     optimizer=optimizer,
+    #     loss_scaler=loss_scaler,
+    # )
 
     if args.eval:
 
@@ -428,19 +457,26 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model,
-            criterion,
-            data_loader_train,
-            optimizer,
-            device,
-            epoch,
-            loss_scaler,
-            args.clip_grad,
-            mixup_fn,
-            log_writer=log_writer,
-            args=args
-        )
+        print(torch.cuda.memory_summary(device=torch.cuda.current_device()))
+        try:
+            train_stats = train_one_epoch(
+                model,
+                criterion,
+                data_loader_train,
+                optimizer,
+                device,
+                epoch,
+                loss_scaler,
+                args.clip_grad,
+                mixup_fn,
+                args=args
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print("CUDA OOM error detected:")
+                print(torch.cuda.memory_summary(device=torch.cuda.current_device()))
+            else:
+                raise e  # Re-raise if it's not a memory error
         if (epoch % 50 == 0 or epoch + 1 == args.epochs):
             print("Saving model at epoch:", epoch)
             misc.save_model(

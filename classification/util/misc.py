@@ -338,7 +338,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, be
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
     if loss_scaler is not None:
-        if is_best:
+        if best_model:
             filename = 'model_best.pth.tar'
         if is_main_process():
             checkpoint_path = os.path.join(wandb.run.dir, filename)

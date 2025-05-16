@@ -38,7 +38,6 @@ def train_one_epoch(
     loss_scaler,
     max_norm: float = 0,
     mixup_fn: Optional[Mixup] = None,
-    log_writer=None,
     args=None,
 ):
     model.train(True)
@@ -51,12 +50,10 @@ def train_one_epoch(
 
     optimizer.zero_grad()
 
-    if log_writer is not None:
-        print("log_dir: {}".format(log_writer.log_dir))
-
     for data_iter_step, (samples, targets) in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
+        # print(f'Working on batch {data_iter_step}')
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(
@@ -68,6 +65,9 @@ def train_one_epoch(
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
+        
+        if args.channels_last:
+            samples = samples.contiguous(memory_format=torch.channels_last)
 
         with torch.cuda.amp.autocast():
             outputs = model(samples)
@@ -133,6 +133,9 @@ def evaluate(data_loader, model, device):
         target = batch[-1]
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+
+        if args.channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
 
         # compute output
         with torch.cuda.amp.autocast():

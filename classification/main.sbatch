@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH -J CIFAR10-LISNN-Pushpull
+#SBATCH -J IN100-PP
 #SBATCH --output=slurm-%j_x.out
 #SBATCH --array=0
 #SBATCH -c 8
-#SBATCH --time=00-04:00:00
-#SBATCH --gres=gpu:2
+#SBATCH --time=00-00:15:00
+#SBATCH --gres=gpu:a100:1
 #SBATCH --mem=32GB
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 
 set -e
 set -x
@@ -30,18 +30,26 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SEED=32
 SESSION_ID=$(openssl rand -hex 4)
 
-DATASET_NAME="CIFAR10"
+DATASET_NAME="ImageNet-100"
+DATASET_DIR="$TMPDIR/dataset/"
 
-COMMON_ARGS="--batch_size 32 --epochs 300 --model spiliformer_tiny --data_path ../data/cifar10/ \
-             --model_mode ms --layer_decay 1.0 --lr 1e-3 --time_steps 4 --weight_decay 6e-2 \
-             --dataset ${DATASET_NAME} --seed ${SEED} --color_jitter 0.2 --aa rand-m9 \
-             --reprob 0.1 --remode pixel --recount 1"
+mkdir -p "$TMPDIR/dataset"
+
+# Extract dataset
+SECONDS=0
+echo "Extracting ${DATASET_NAME}.tar"
+tar -xf "/scratch/hb-prismaset/datasets/${DATASET_NAME}.tar" -C "$TMPDIR/dataset"
+echo "Time taken to extract dataset: ${SECONDS} seconds"
+
+COMMON_ARGS="--stage1 token --stage2 token --stage3 spiking \
+             --batch_size 8 --epochs 90 --model QKFormer_10_768 --data_path ${DATASET_DIR}/ImageNet-100 \
+             --model_mode ms --dataset ${DATASET_NAME} --seed ${SEED} --time_steps 1"
 EXPERIMENT_NAME="${TIMESTAMP}_s${SEED}"
 
 
 # Initialize job array
 case ${SLURM_ARRAY_TASK_ID} in
-0) torchrun --standalone --nproc_per_node=2 main_finetune.py ${COMMON_ARGS} --push_pull --name ${EXPERIMENT_NAME} --wandb_tags ${DATASET_NAME} pp "s${SEED}" ;;
+0) torchrun --standalone --nproc_per_node=1 main_finetune.py ${COMMON_ARGS} --name ${EXPERIMENT_NAME} --wandb_tags ${DATASET_NAME} QK "s${SEED}" ;;
 # 0) torchrun --standalone --nproc_per_node=2 main_finetune.py ${COMMON_ARGS} --output_dir ${EXPERIMENT_NAME} --log_dir ${EXPERIMENT_NAME};;
 esac
 
